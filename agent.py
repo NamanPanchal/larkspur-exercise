@@ -68,7 +68,7 @@ def run_agent(pnr: str, last_name: str, message: str) -> str:            # ✏�
     answer = ""
     turns = 1
     while response.stop_reason == "tool_use" and turns < MAX_TOOL_CALLS:
-        messages.append({"role": "assistant", "content": text_of(response)})
+        messages.append({"role": "assistant", "content": response.content})
         messages.append({"role": "user", "content": tool_results(response)})
         answer = text_of(response)
         response = client.messages.create(
@@ -77,13 +77,13 @@ def run_agent(pnr: str, last_name: str, message: str) -> str:            # ✏�
         )
         turns += 1
 
-    return answer
+    return text_of(response)
 
 
 def tool_list() -> List[Dict[str, Any]]:                   # ✏️ Build 2, step 2.2
     """Given. Exactly what Claude is offered on every turn; run.py --show-tools
     prints this list."""
-    return build_tools() + EXTRA_TOOLS
+    return build_tools() + mcp_client.tools() + EXTRA_TOOLS
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -119,17 +119,32 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
                 "type": "object",
                 "properties": {
                     "flight_no": {"type": "string"},
-                    "date": {"type": "string", "description": "MM/DD/YYYY"},
+                    "date": {"type": "string", "description": "YYYY-MM-DD"},
                 },
                 "required": ["flight_no", "date"],
             },
         },
         {
             "name": "search_alternatives",
-            "description": "search",
+            "description": (
+                "List the rebooking options Larkspur can offer for the disrupted flight on "
+                "a booking: ranked alternative flights on the same route and cabin, each "
+                "with an option_id, the flight(s), the date and seat availability for the "
+                "number of passengers on the booking. Use it once lookup_booking and "
+                "get_flight_status show the flight is cancelled, badly delayed or the "
+                "connection is missed, and before offering the customer any alternative. "
+                "Needs only the PNR. The option_id it returns is what hold_seat takes; never "
+                "invent an option or its times. It does not hold or book anything, and it "
+                "leaves out the original flight."
+            ),
             "input_schema": {
                 "type": "object",
-                "properties": {"pnr": {"type": "string"}},
+                "properties": {
+                    "pnr": {
+                        "type": "string",
+                        "description": "The booking's confirmation code (PNR). The last name is not needed.",
+                    },
+                },
                 "required": ["pnr"],
             },
         },
