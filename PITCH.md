@@ -16,3 +16,5 @@ Costs: About $0.07 of model cost per ticket on our one traced run, about 1% of t
 Wrong: The agent can still say something untrue. Flight facts come from a tool call, never from memory, and every policy answer carries a policy_row_id we can check. We find errors by reading the trace and running our eval cases (not written yet). When it is wrong or unsure, the customer is handed to a human with the agent's reasoning attached, and nothing irreversible happens without the customer's own click.
 Runs it: Not decided, and it needs a name before we leave. We propose a Larkspur contact-center operations lead who reads the traces and escalations weekly, with a policy owner who updates the policy table and tool descriptions when Handbook v14 changes. The eval cases and bench.py are the handover kit.
 Left out: Voice (the scope is chat only). Group bookings, partner segments, unaccompanied minors and refunds, which go to a human by design. Tone handling for abusive customers (intelligence lever, not built yet). Live connections to Altura and OpsFeed: everything ran on a frozen copy of the data.
+
+Lever: intelligence
