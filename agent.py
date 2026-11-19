@@ -13,12 +13,71 @@ from typing import Any, Dict, List
 from support import (MODEL, SYSTEM_PROMPT, call_local, execute_tool, mcp_client,
                      new_session, next_available_day, record_tool_result,
                      runtime_preamble)
+from support import mock_backend
 
 MAX_TOOL_CALLS = 8  # Larkspur's own build capped the loop here; then a human takes over.
 
 TONE_ADDENDUM = ""                       # ✏️ Build 4, step 4.1, intelligence goal
-EXTRA_TOOLS: List[Dict[str, Any]] = []   # ✏️ Build 2, step 2.1: schemas for the tools you add
-LOCAL_TOOLS: Dict[str, Any] = {}         # ✏️ Build 2, step 2.1: the functions behind them
+
+
+def flight_remarks(flight_no: str, date: str) -> Dict[str, Any]:
+    """The ops note on one flight-date: why it is late or cancelled, from flights.csv."""
+    for row in mock_backend.load_flights():
+        if row["flight_no"] == flight_no and row["date"] == date:
+            return {
+                "flight_no": flight_no, "date": date, "status": row["status"],
+                "delay_min": row["delay_min"], "cause_code": row["cause_code"] or None,
+                "remarks": row["remarks"] or None,
+            }
+    return {"error": "no flight %s on %s in the OpsFeed data" % (flight_no, date)}
+
+
+def booking_party_size(pnr: str, last_name: str) -> Dict[str, Any]:
+    """How many people a booking covers, and whether it is a group. From bookings.json."""
+    booking = mock_backend.load_bookings()["bookings"].get(pnr)
+    if not booking or not any(p["last_name"].lower() == last_name.lower()
+                              for p in booking["passengers"]):
+        return {"error": "no booking %s for last name %s" % (pnr, last_name)}
+    group = booking.get("group") or {}
+    return {
+        "pnr": pnr,
+        "is_group_booking": bool(booking.get("is_group_booking")),
+        "passengers_listed": len(booking["passengers"]),
+        "group_pax_count": group.get("pax_count"),
+        "remarks": booking.get("remarks", []),
+    }
+
+
+EXTRA_TOOLS: List[Dict[str, Any]] = [        # ✏️ Build 2, step 2.1: schemas for the tools you add
+    {
+        "name": "flight_remarks",
+        "description": "Get the ops note for one flight on one date: the free-text reason behind a delay or cancellation (for example a held aircraft or a diversion airport), plus status, delay minutes and cause code. Call it when the customer asks why a flight is late or whether it is likely to get worse. Paraphrase the remarks but never embellish them; if remarks is null, say there is no further detail.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "flight_no": {"type": "string", "description": "Flight number, e.g. LK415."},
+                "date": {"type": "string", "description": "Local date, YYYY-MM-DD."},
+            },
+            "required": ["flight_no", "date"],
+        },
+    },
+    {
+        "name": "booking_party_size",
+        "description": "Count how many people a booking covers and whether it is a group booking. Call it when the customer says how many are travelling, or when a booking looks like a group, before offering options or seats. It returns the passengers actually listed and, for a group, the contract headcount; if the two differ, say so and do not guess which is right.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pnr": {"type": "string", "description": "The 6-character booking reference, e.g. G2HL9V."},
+                "last_name": {"type": "string", "description": "A passenger's last name on that booking."},
+            },
+            "required": ["pnr", "last_name"],
+        },
+    },
+]
+LOCAL_TOOLS: Dict[str, Any] = {              # ✏️ Build 2, step 2.1: the functions behind them
+    "flight_remarks": flight_remarks,
+    "booking_party_size": booking_party_size,
+}
 
 
 def text_of(response) -> str:
