@@ -18,6 +18,84 @@ from support import mock_backend
 MAX_TOOL_CALLS = 8  # Larkspur's own build capped the loop here; then a human takes over.
 
 TONE_ADDENDUM = ""                       # ✏️ Build 4, step 4.1, intelligence goal
+from support.mock_backend import load_policy
+
+
+def _band_for(policy, status, delay_minutes):
+    if status == "CANCELLED":
+        return "CXL"
+    if status == "DIVERTED":
+        return "DIV"
+    for b in policy["delay_bands"]:
+        if b["band"] in ("CXL", "DIV"):
+            continue
+        hi = b["max_minutes"]
+        if b["min_minutes"] <= delay_minutes and (hi is None or delay_minutes <= hi):
+            return b["band"]
+    return None
+
+
+def care_entitlements(cause_code, status, delay_minutes=0, overnight=False,
+                      wait_minutes_for_alternative=None, loyalty_tier=None):
+    """Meal / hotel / ground care from disruption_policy.json. No booking needed."""
+    policy = load_policy()
+    if cause_code not in policy["cause_classes"]:
+        return {"error": "cause_code must be one of %s" % sorted(policy["cause_classes"])}
+    cause_class = policy["cause_classes"][cause_code]
+    band = _band_for(policy, status, delay_minutes)
+    row = next((r for r in policy["rows"]
+                if r["cause_class"] == cause_class and r["band"] == band), None)
+    if row is None:
+        return {"error": "No policy row for %s/%s" % (cause_class, band)}
+    care = row["care"]
+
+    meal = care["meal_usd"]
+    if isinstance(meal, dict):
+        need = meal["if_wait_minutes_for_alternative_gte"]
+        if wait_minutes_for_alternative is None:
+            meal_out = {"conditional": True, "if_wait_at_least_minutes": need, "amount_usd": meal["amount"]}
+        else:
+            meal_out = {"amount_usd": meal["amount"] if wait_minutes_for_alternative >= need
+                        else meal.get("else", 0)}
+    else:
+        meal_out = {"amount_usd": meal}
+    bonus = policy["loyalty_rules"].get(loyalty_tier or "Member", {})
+    if meal_out["amount_usd"] and bonus.get("meal_bonus_usd"):
+        meal_out["amount_usd"] = min(meal_out["amount_usd"] + bonus["meal_bonus_usd"],
+                                     bonus.get("meal_bonus_cap_usd", 10**6))
+
+    hotel = care["hotel"]
+    if hotel.get("eligible") == "if_overnight":
+        hotel_out = {"eligible": bool(overnight)}
+        if overnight:
+            hotel_out.update(nightly_cap_usd=hotel["nightly_cap_usd"], nights=hotel["nights"],
+                             approval=hotel["approval"])
+    else:
+        hotel_out = {k: v for k, v in hotel.items() if k in ("eligible", "instead")}
+
+    ground = care["ground_usd"]
+    if isinstance(ground, dict) and "if_overnight" in ground:
+        ground_out = {"amount_usd": ground["if_overnight"] if overnight else ground["else"]}
+    else:
+        ground_out = ground if isinstance(ground, dict) else {"amount_usd": ground}
+
+    return {"source": "disruption_policy.json v%s" % policy["version"], "cause_class": cause_class,
+            "band": band, "meal": meal_out, "hotel": hotel_out, "ground": ground_out,
+            "note": "Informational. Refer to it as a credit or voucher, never a guarantee."}
+
+
+def cause_in_plain_words(cause_code, language="en"):
+    """Customer-safe wording for a cause code, from cause_labels_customer."""
+    policy = load_policy()
+    labels = policy["cause_labels_customer"].get(cause_code)
+    if not labels:
+        return {"error": "cause_code must be one of %s" % sorted(policy["cause_labels_customer"])}
+    cls = policy["cause_classes"][cause_code]
+    return {"cause_code": cause_code, "label": labels.get(language, labels["en"]),
+            "language": language if language in labels else "en",
+            "within_our_control": cls == "controllable",
+            "note": "Name the cause only with this label. Do not elaborate or assign blame."}
+
 
 
 def flight_remarks(flight_no: str, date: str) -> Dict[str, Any]:
@@ -47,8 +125,58 @@ def booking_party_size(pnr: str, last_name: str) -> Dict[str, Any]:
         "remarks": booking.get("remarks", []),
     }
 
-
-EXTRA_TOOLS: List[Dict[str, Any]] = [        # ✏️ Build 2, step 2.1: schemas for the tools you add
+EXTRA_TOOLS: List[Dict[str, Any]] = [   # ✏️ Build 2, step 2.1: schemas for the tools you add
+    {
+        "name": "care_entitlements",
+        "description": (
+            "Answer a general 'do I get a meal, hotel or ground transport while I wait?' "
+            "question from Larkspur's care policy table (Handbook section 6). Needs no "
+            "booking: pass the cause_code and status from get_flight_status, plus "
+            "delay_minutes. Returns only the meal, hotel and ground-transport care for "
+            "that situation, with conditions such as overnight or wait time. It is "
+            "informational and cites no policy_row_id; it does not cover rebooking, "
+            "refunds or goodwill, and never issues anything. Use check_policy for the "
+            "full decision on a booking before issuing a voucher."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cause_code": {"type": "string", "enum": ["WX", "ATC", "MX", "CREW", "SEC"],
+                               "description": "Cause from get_flight_status, never inferred from customer text."},
+                "status": {"type": "string", "enum": ["ON_TIME", "DELAYED", "CANCELLED", "DIVERTED"],
+                           "description": "Flight status from get_flight_status."},
+                "delay_minutes": {"type": "integer",
+                                  "description": "Departure delay in minutes. Use 0 for CANCELLED or DIVERTED."},
+                "overnight": {"type": "boolean",
+                              "description": "True if the customer is stranded overnight away from their home airport."},
+                "wait_minutes_for_alternative": {"type": "integer",
+                                                 "description": "Minutes until the chosen alternative departs. Omit if none chosen yet."},
+                "loyalty_tier": {"type": "string", "enum": ["Member", "Silver", "Gold", "Summit"],
+                                 "description": "From the booking; Gold and Summit get a larger meal credit."},
+            },
+            "required": ["cause_code", "status"],
+        },
+    },
+    {
+        "name": "cause_in_plain_words",
+        "description": (
+            "Turn a cause code into the wording Larkspur allows for customers, for "
+            "questions like 'why was my flight cancelled?'. Pass the cause_code from "
+            "get_flight_status. Returns the approved customer label (e.g. 'weather') and "
+            "whether it was within Larkspur's control. Use only this label when naming "
+            "a cause; never elaborate or blame anyone. Does not look up a flight or a policy."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cause_code": {"type": "string", "enum": ["WX", "ATC", "MX", "CREW", "SEC"],
+                               "description": "Cause from get_flight_status."},
+                "language": {"type": "string", "enum": ["en", "es"],
+                             "description": "Customer's language from the booking. Defaults to en."},
+            },
+            "required": ["cause_code"],
+        },
+    },
     {
         "name": "flight_remarks",
         "description": "Get the ops note for one flight on one date: the free-text reason behind a delay or cancellation (for example a held aircraft or a diversion airport), plus status, delay minutes and cause code. Call it when the customer asks why a flight is late or whether it is likely to get worse. Paraphrase the remarks but never embellish them; if remarks is null, say there is no further detail.",
@@ -74,7 +202,9 @@ EXTRA_TOOLS: List[Dict[str, Any]] = [        # ✏️ Build 2, step 2.1: schemas
         },
     },
 ]
-LOCAL_TOOLS: Dict[str, Any] = {              # ✏️ Build 2, step 2.1: the functions behind them
+LOCAL_TOOLS: Dict[str, Any] = {          # ✏️ Build 2, step 2.1: the functions behind them
+    "care_entitlements": care_entitlements,
+    "cause_in_plain_words": cause_in_plain_words,
     "flight_remarks": flight_remarks,
     "booking_party_size": booking_party_size,
 }
@@ -142,7 +272,7 @@ def run_agent(pnr: str, last_name: str, message: str) -> str:            # ✏�
 def tool_list() -> List[Dict[str, Any]]:                   # ✏️ Build 2, step 2.2
     """Given. Exactly what Claude is offered on every turn; run.py --show-tools
     prints this list."""
-    return build_tools() + EXTRA_TOOLS
+    return build_tools() + mcp_client.tools() + EXTRA_TOOLS
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -185,10 +315,27 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
         },
         {
             "name": "search_alternatives",
-            "description": "Find rebooking options for a passenger once the flight is known to be cancelled or badly delayed. Always call it, after check_policy, whenever the flight is cancelled: a reply without concrete options leaves the customer with nothing to choose. Needs the booking's pnr. Returns ranked options, each with an option_id, flights, date and seats left, which you can pass to hold_seat.",
+            "description": (
+                "List the rebooking options Larkspur can offer for the disrupted flight on "
+                "a booking: ranked alternative flights on the same route and cabin, each "
+                "with an option_id, the flight(s), the date and seat availability for the "
+                "number of passengers on the booking. Use it once lookup_booking and "
+                "get_flight_status show the flight is cancelled, badly delayed or the "
+                "connection is missed, and before offering the customer any alternative. "
+                "Always call it, after check_policy, whenever the flight is cancelled: a reply "
+                "without concrete options leaves the customer with nothing to choose. "
+                "Needs only the PNR. The option_id it returns is what hold_seat takes; never "
+                "invent an option or its times. It does not hold or book anything, and it "
+                "leaves out the original flight."
+            ),
             "input_schema": {
                 "type": "object",
-               "properties": {"pnr": {"type": "string", "description": "The 6-character booking reference, e.g. K7PQ2M."}},
+                "properties": {
+                    "pnr": {
+                        "type": "string",
+                        "description": "The booking's confirmation code (PNR). The last name is not needed.",
+                    },
+                },
                 "required": ["pnr"],
             },
         },
